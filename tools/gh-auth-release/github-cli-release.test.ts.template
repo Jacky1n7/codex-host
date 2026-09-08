@@ -1,0 +1,66 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { fetchLatestGitHubReleaseWithGitHubCli } from "@codexhost/update-manager";
+
+function release() {
+  return {
+    tag_name: "v1.2.3-gh.1",
+    html_url: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3-gh.1",
+    draft: false,
+    prerelease: false,
+    body: "Authenticated update fixture",
+    assets: [
+      {
+        name: "codexhost-1.2.3-gh.1-macos-arm64.dmg",
+        size: 42,
+        digest: `sha256:${"ab".repeat(32)}`,
+        browser_download_url:
+          "https://github.com/BytePioneer-AI/codex-host/releases/download/v1.2.3-gh.1/codexhost-1.2.3-gh.1-macos-arm64.dmg",
+      },
+    ],
+  };
+}
+
+describe("authenticated GitHub Release discovery", () => {
+  it("uses the logged-in GitHub CLI before anonymous HTTP is needed", async () => {
+    const run = vi.fn(async () => JSON.stringify(release()));
+    await expect(
+      fetchLatestGitHubReleaseWithGitHubCli({
+        environment: { PATH: "/usr/bin:/bin" },
+        executableCandidates: ["/opt/homebrew/bin/gh"],
+        run,
+      }),
+    ).resolves.toMatchObject({ version: "1.2.3-gh.1" });
+    expect(run).toHaveBeenCalledWith(
+      "/opt/homebrew/bin/gh",
+      expect.arrayContaining(["api", "repos/BytePioneer-AI/codex-host/releases/latest"]),
+      { environment: { PATH: "/usr/bin:/bin" } },
+    );
+  });
+
+  it("finds Homebrew gh with a minimal macOS GUI PATH", async () => {
+    const run = vi.fn(async (executable: string) => {
+      if (executable === "gh") throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      return JSON.stringify(release());
+    });
+    await expect(
+      fetchLatestGitHubReleaseWithGitHubCli({
+        environment: { PATH: "/usr/bin:/bin" },
+        platform: "darwin",
+        run,
+      }),
+    ).resolves.toMatchObject({ version: "1.2.3-gh.1" });
+    expect(run.mock.calls.map(([executable]) => executable)).toEqual([
+      "gh",
+      "/opt/homebrew/bin/gh",
+    ]);
+  });
+
+  it("returns null without exposing GitHub CLI diagnostics", async () => {
+    const run = vi.fn(async () => {
+      throw new Error("private CLI diagnostic");
+    });
+    await expect(fetchLatestGitHubReleaseWithGitHubCli({ run })).resolves.toBeNull();
+    expect(run).toHaveBeenCalledOnce();
+  });
+});
