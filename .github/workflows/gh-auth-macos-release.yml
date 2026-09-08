@@ -1,0 +1,196 @@
+name: gh-authenticated macOS release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gh-authenticated-macos-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: BytePioneer-AI/codex-host
+
+jobs:
+  discover:
+    name: Discover upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      build_required: ${{ steps.release.outputs.build_required }}
+      custom_tag: ${{ steps.release.outputs.custom_tag }}
+      custom_version: ${{ steps.release.outputs.custom_version }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      upstream_version: ${{ steps.release.outputs.upstream_version }}
+    steps:
+      - name: Resolve release versions
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream_tag="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "unexpected upstream tag: ${upstream_tag}" >&2
+            exit 1
+          fi
+          upstream_version="${upstream_tag#v}"
+          custom_version="${upstream_version}-gh.1"
+          custom_tag="v${custom_version}"
+          build_required=true
+          if gh release view "$custom_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build_required=false
+          fi
+          echo "upstream_tag=${upstream_tag}" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=${upstream_version}" >> "$GITHUB_OUTPUT"
+          echo "custom_tag=${custom_tag}" >> "$GITHUB_OUTPUT"
+          echo "custom_version=${custom_version}" >> "$GITHUB_OUTPUT"
+          echo "build_required=${build_required}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build M-series Mac package
+    if: needs.discover.outputs.build_required == 'true'
+    needs: discover
+    runs-on: macos-14
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v4
+        with:
+          path: automation
+
+      - name: Checkout upstream release
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.discover.outputs.upstream_tag }}
+          path: source
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: source/.node-version
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Setup npm
+        shell: bash
+        run: |
+          npm_version="$(node -p 'require("./source/package.json").packageManager.split("@").at(-1)')"
+          npm install --global "npm@${npm_version}"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Prepare authenticated update channel
+        run: >
+          node automation/tools/gh-auth-release/prepare.mjs
+          --source source
+          --version "${{ needs.discover.outputs.upstream_version }}"
+          --repository "$GITHUB_REPOSITORY"
+
+      - name: Install dependencies
+        working-directory: source
+        run: npm ci
+
+      - name: Build TypeScript prerequisites
+        working-directory: source
+        run: npm run build:typescript
+
+      - name: Test authenticated release discovery
+        working-directory: source
+        run: >
+          npx vitest run --config tests/vitest.config.js
+          packages/update-manager/test/github-release.test.ts
+          packages/update-manager/test/github-cli-release.test.ts
+
+      - name: Build macOS arm64 installer
+        working-directory: source
+        run: npm run release:package -- --target macos-arm64
+
+      - name: Verify packaged update channel
+        shell: bash
+        env:
+          CUSTOM_VERSION: ${{ needs.discover.outputs.custom_version }}
+        run: |
+          set -euo pipefail
+          artifact="source/build/release/${CUSTOM_VERSION}/macos-arm64/codexhost-${CUSTOM_VERSION}-macos-arm64.dmg"
+          test -s "$artifact"
+          mount_plist="$(mktemp)"
+          hdiutil attach -readonly -nobrowse -plist "$artifact" > "$mount_plist"
+          mount_point="$(plutil -extract system-entities json -o - "$mount_plist" | python3 -c 'import json,sys; print(next(item["mount-point"] for item in json.load(sys.stdin) if "mount-point" in item))')"
+          trap 'hdiutil detach "$mount_point" >/dev/null' EXIT
+          runtime="$mount_point/codexhost.app/Contents/Resources/app/host-runtime.mjs"
+          grep -q 'fetchLatestGitHubReleaseWithGitHubCli' "$runtime"
+          grep -q "api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" "$runtime"
+          codesign --verify --deep --strict "$mount_point/codexhost.app"
+          shasum -a 256 "$artifact"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexhost-${{ needs.discover.outputs.custom_version }}-macos-arm64
+          path: source/build/release/${{ needs.discover.outputs.custom_version }}/macos-arm64/codexhost-${{ needs.discover.outputs.custom_version }}-macos-arm64.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish custom update
+    if: needs.discover.outputs.build_required == 'true'
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: codexhost-${{ needs.discover.outputs.custom_version }}-macos-arm64
+          path: release
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUSTOM_TAG: ${{ needs.discover.outputs.custom_tag }}
+          CUSTOM_VERSION: ${{ needs.discover.outputs.custom_version }}
+          UPSTREAM_TAG: ${{ needs.discover.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          upstream_url="https://github.com/${UPSTREAM_REPOSITORY}/releases/tag/${UPSTREAM_TAG}"
+          artifact="release/codexhost-${CUSTOM_VERSION}-macos-arm64.dmg"
+          digest="$(sha256sum "$artifact" | awk '{print $1}')"
+          {
+            echo "Automated macOS arm64 build of [${UPSTREAM_TAG}](${upstream_url})."
+            echo
+            echo "This build keeps update discovery authenticated through the local GitHub CLI and follows future releases from this fork. GitHub credentials remain owned by gh."
+            echo
+            echo "SHA-256: \`${digest}\`"
+            echo
+            echo "After installing the first build manually, later custom releases are available through codexhost's normal updater."
+          } > release-notes.md
+          gh release create "$CUSTOM_TAG" "$artifact" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
+            --title "codexhost ${CUSTOM_VERSION} (gh-authenticated)" \
+            --notes-file release-notes.md \
+            --latest
+          expected_digest="sha256:${digest}"
+          for attempt in 1 2 3 4 5; do
+            published_digest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${CUSTOM_TAG}" --jq ".assets[] | select(.name == \"codexhost-${CUSTOM_VERSION}-macos-arm64.dmg\") | .digest // empty")"
+            if [[ "$published_digest" == "$expected_digest" ]]; then
+              echo "Published asset digest verified: ${published_digest}"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "published asset digest did not match ${expected_digest}" >&2
+          exit 1
