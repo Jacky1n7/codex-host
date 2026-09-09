@@ -30,6 +30,13 @@ function requireVersion(value) {
   return value;
 }
 
+function requireRevision(value) {
+  if (!/^[1-9]\d*$/u.test(value)) {
+    throw new Error(`channel revision must be a positive integer: ${value}`);
+  }
+  return value;
+}
+
 function sourceFile(root, relativePath) {
   return path.join(root, ...relativePath.split("/"));
 }
@@ -103,6 +110,7 @@ function routeReleaseChannel(root, releaseRepository) {
   const requiredReleaseFiles = [
     "packages/update-manager/src/github-release.ts",
     "packages/update-manager/src/github-cli-release.ts",
+    "packages/shared-contracts/src/updates.ts",
     "packages/renderer-extension/src/settings/pages.ts",
     "crates/platform/src/desktop_launch.rs",
   ];
@@ -111,6 +119,7 @@ function routeReleaseChannel(root, releaseRepository) {
     "packages/update-manager/test/github-cli-release.test.ts",
     "packages/update-manager/test/github-cli-process.test.ts",
     "packages/host-runtime/test/update-coordinator.test.ts",
+    "packages/shared-contracts/test/updates.test.ts",
     "packages/renderer-extension/test/settings/pages.test.ts",
   ];
   const rewrite = (relativePath) => {
@@ -160,6 +169,13 @@ function verifyPreparedSource(root, releaseRepository, customVersion) {
   if (!coordinator.includes("fetchLatestGitHubReleaseWithGitHubCli")) {
     throw new Error("authenticated GitHub CLI discovery is missing from the coordinator");
   }
+  const sharedContracts = readFileSync(
+    sourceFile(root, "packages/shared-contracts/src/updates.ts"),
+    "utf8",
+  );
+  if (!sharedContracts.includes(releaseRepository.replaceAll("/", "\\/"))) {
+    throw new Error("shared Release URL contract was not routed to the custom channel");
+  }
   for (const relativePath of [
     "packages/renderer-extension/src/settings/pages.ts",
     "crates/platform/src/desktop_launch.rs",
@@ -175,7 +191,8 @@ const arguments_ = parseArguments(process.argv.slice(2));
 const root = path.resolve(arguments_.get("source") ?? "");
 const upstreamVersion = requireVersion(arguments_.get("version") ?? "");
 const releaseRepository = requireRepository(arguments_.get("repository") ?? "");
-const customVersion = `${upstreamVersion}-gh.1`;
+const revision = requireRevision(arguments_.get("revision") ?? "");
+const customVersion = `${upstreamVersion}-gh.${revision}`;
 
 installAuthenticatedDiscovery(root);
 routeReleaseChannel(root, releaseRepository);
