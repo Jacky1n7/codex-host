@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CHANNEL_REVISION: "2"
   UPSTREAM_REPOSITORY: BytePioneer-AI/codex-host
 
 jobs:
@@ -39,7 +40,7 @@ jobs:
             exit 1
           fi
           upstream_version="${upstream_tag#v}"
-          custom_version="${upstream_version}-gh.1"
+          custom_version="${upstream_version}-gh.${CHANNEL_REVISION}"
           custom_tag="v${custom_version}"
           build_required=true
           if gh release view "$custom_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -98,6 +99,7 @@ jobs:
           --source source
           --version "${{ needs.discover.outputs.upstream_version }}"
           --repository "$GITHUB_REPOSITORY"
+          --revision "$CHANNEL_REVISION"
 
       - name: Install dependencies
         working-directory: source
@@ -111,6 +113,7 @@ jobs:
         working-directory: source
         run: >
           npx vitest run --config tests/vitest.config.js
+          packages/shared-contracts/test/updates.test.ts
           packages/update-manager/test/github-release.test.ts
           packages/update-manager/test/github-cli-release.test.ts
 
@@ -133,6 +136,8 @@ jobs:
           runtime="$mount_point/codexhost.app/Contents/Resources/app/host-runtime.mjs"
           grep -q 'fetchLatestGitHubReleaseWithGitHubCli' "$runtime"
           grep -q "api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" "$runtime"
+          grep -q "github.com/${GITHUB_REPOSITORY}/releases/tag" "$runtime"
+          grep -q "github.com/${GITHUB_REPOSITORY}/releases/tag" "$mount_point/codexhost.app/Contents/Resources/app/renderer-extension.js"
           codesign --verify --deep --strict "$mount_point/codexhost.app"
           shasum -a 256 "$artifact"
 
