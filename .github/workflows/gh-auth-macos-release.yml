@@ -134,10 +134,13 @@ jobs:
           mount_point="$(plutil -extract system-entities json -o - "$mount_plist" | python3 -c 'import json,sys; print(next(item["mount-point"] for item in json.load(sys.stdin) if "mount-point" in item))')"
           trap 'hdiutil detach "$mount_point" >/dev/null' EXIT
           runtime="$mount_point/codexhost.app/Contents/Resources/app/host-runtime.mjs"
+          renderer="$mount_point/codexhost.app/Contents/Resources/app/renderer-extension.js"
+          escaped_repository="${GITHUB_REPOSITORY//\//\\/}"
+          release_contract="github\\.com\\/${escaped_repository}\\/releases\\/tag"
           grep -q 'fetchLatestGitHubReleaseWithGitHubCli' "$runtime"
           grep -q "api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" "$runtime"
-          grep -q "github.com/${GITHUB_REPOSITORY}/releases/tag" "$runtime"
-          grep -q "github.com/${GITHUB_REPOSITORY}/releases/tag" "$mount_point/codexhost.app/Contents/Resources/app/renderer-extension.js"
+          grep -Fq "$release_contract" "$runtime"
+          grep -Fq "$release_contract" "$renderer"
           codesign --verify --deep --strict "$mount_point/codexhost.app"
           shasum -a 256 "$artifact"
 
